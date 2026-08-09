@@ -201,23 +201,17 @@ wss.on("connection", (socket) => {
     // ==========================================
 
     if (data.type === "PLAYER_STATE") {
-      if (!player.roomCode) {
-        return;
-      }
+      if (!player.roomCode) return;
 
       const room = rooms.get(player.roomCode);
 
-      if (!room) {
-        return;
-      }
+      if (!room) return;
 
       const otherPlayer = room.players.find(
         (p) => p !== player
       );
 
-      if (!otherPlayer) {
-        return;
-      }
+      if (!otherPlayer) return;
 
       const state = {
         type: "PLAYER_STATE",
@@ -242,25 +236,18 @@ wss.on("connection", (socket) => {
     // ==========================================
 
     if (data.type === "PLAYER_ATTACK") {
-      if (!player.roomCode) {
-        return;
-      }
+      if (!player.roomCode) return;
 
       const room = rooms.get(player.roomCode);
 
-      if (!room) {
-        return;
-      }
+      if (!room) return;
 
       const otherPlayer = room.players.find(
         (p) => p !== player
       );
 
-      if (!otherPlayer) {
-        return;
-      }
+      if (!otherPlayer) return;
 
-      // Only allow the two attacks currently implemented.
       if (
         data.attack !== "punch" &&
         data.attack !== "kick"
@@ -275,11 +262,90 @@ wss.on("connection", (socket) => {
         timestamp: Date.now()
       };
 
-      // Send the attack ONLY to the opponent.
       send(otherPlayer.socket, attack);
 
       console.log(
         `Player ${player.playerNumber} used ${data.attack} in room ${room.code}`
+      );
+
+      return;
+    }
+
+    // ==========================================
+    // PLAYER DEFENSE
+    // ==========================================
+
+    if (data.type === "PLAYER_DEFENSE") {
+      if (!player.roomCode) return;
+
+      const room = rooms.get(player.roomCode);
+
+      if (!room) return;
+
+      const otherPlayer = room.players.find(
+        (p) => p !== player
+      );
+
+      if (!otherPlayer) return;
+
+      if (
+        data.action !== "start" &&
+        data.action !== "stop"
+      ) {
+        return;
+      }
+
+      const defense = {
+        type: "PLAYER_DEFENSE",
+        player: player.playerNumber,
+        action: data.action,
+        timestamp: Date.now()
+      };
+
+      send(otherPlayer.socket, defense);
+
+      console.log(
+        `Player ${player.playerNumber} defense: ${data.action}`
+      );
+
+      return;
+    }
+
+    // ==========================================
+    // PLAYER DODGE
+    // ==========================================
+
+    if (data.type === "PLAYER_DODGE") {
+      if (!player.roomCode) return;
+
+      const room = rooms.get(player.roomCode);
+
+      if (!room) return;
+
+      const otherPlayer = room.players.find(
+        (p) => p !== player
+      );
+
+      if (!otherPlayer) return;
+
+      if (
+        data.direction !== "left" &&
+        data.direction !== "right"
+      ) {
+        return;
+      }
+
+      const dodge = {
+        type: "PLAYER_DODGE",
+        player: player.playerNumber,
+        direction: data.direction,
+        timestamp: Date.now()
+      };
+
+      send(otherPlayer.socket, dodge);
+
+      console.log(
+        `Player ${player.playerNumber} dodged ${data.direction} in room ${room.code}`
       );
 
       return;
