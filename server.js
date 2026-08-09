@@ -8,6 +8,11 @@ const wss = new WebSocket.Server({ server });
 
 const rooms = new Map();
 
+// Sessões desconectadas ficam reservadas temporariamente
+const disconnectedSessions = new Map();
+
+const RECONNECT_TIMEOUT = 120000; // 2 minutos
+
 app.get("/", (req, res) => {
   res.send("Multiplayer server online!");
 });
@@ -22,15 +27,24 @@ function generateRoomCode() {
   return code;
 }
 
+function generateSessionId() {
+  return (
+    Date.now().toString(36) +
+    Math.random().toString(36).substring(2, 10)
+  );
+}
+
 function send(socket, data) {
   if (socket.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify(data));
   }
 }
 
-function broadcastRoom(room, data) {
+function broadcastRoom(room, data, exceptPlayer = null) {
   room.players.forEach((player) => {
-    send(player.socket, data);
+    if (player !== exceptPlayer) {
+      send(player.socket, data);
+    }
   });
 }
 
@@ -45,6 +59,86 @@ function resetRematchState(room) {
   });
 }
 
+function createPlayerSession(player) {
+  if (!player.sessionId) {
+    player.sessionId = generateSessionId();
+  }
+
+  return player.sessionId;
+}
+
+function reserveDisconnectedPlayer(player) {
+  if (!player.roomCode || !player.sessionId) return;
+
+  const room = rooms.get(player.roomCode);
+
+  if (!room) return;
+
+  player.disconnected = true;
+
+  const session = {
+    sessionId: player.sessionId,
+    roomCode: player.roomCode,
+    playerNumber: player.playerNumber,
+    room,
+    player,
+    expiresAt: Date.now() + RECONNECT_TIMEOUT
+  };
+
+  disconnectedSessions.set(player.sessionId, session);
+
+  console.log(
+    `Player ${player.playerNumber} disconnected from room ${room.code}`
+  );
+
+  broadcastRoom(
+    room,
+    {
+      type: "OPPONENT_LEFT",
+      message: "Opponent disconnected",
+      player: player.playerNumber
+    },
+    player
+  );
+
+  setTimeout(() => {
+    const savedSession = disconnectedSessions.get(player.sessionId);
+
+    if (!savedSession) return;
+
+    if (Date.now() < savedSession.expiresAt) return;
+
+    disconnectedSessions.delete(player.sessionId);
+
+    const currentRoom = rooms.get(savedSession.roomCode);
+
+    if (!currentRoom) return;
+
+    const savedPlayer = savedSession.player;
+
+    currentRoom.players = currentRoom.players.filter(
+      (p) => p !== savedPlayer
+    );
+
+    if (currentRoom.players.length === 0) {
+      rooms.delete(currentRoom.code);
+    } else {
+      currentRoom.status = "WAITING";
+
+      broadcastRoom(currentRoom, {
+        type: "OPPONENT_LEFT",
+        message: "Opponent left permanently",
+        players: currentRoom.players.length,
+        status: currentRoom.status
+      });
+    }
+
+    console.log(
+      `Reconnect timeout expired for session ${savedSession.sessionId}`
+    );
+  }, RECONNECT_TIMEOUT + 1000);
+}
+
 function removePlayerFromRoom(player) {
   if (!player.roomCode) return;
 
@@ -52,11 +146,16 @@ function removePlayerFromRoom(player) {
 
   if (!room) return;
 
+  if (player.sessionId) {
+    disconnectedSessions.delete(player.sessionId);
+  }
+
   room.players = room.players.filter((p) => p !== player);
 
   player.roomCode = null;
   player.playerNumber = null;
   player.rematchReady = false;
+  player.disconnected = false;
 
   if (room.players.length === 0) {
     rooms.delete(room.code);
@@ -81,7 +180,9 @@ wss.on("connection", (socket) => {
     socket,
     roomCode: null,
     playerNumber: null,
-    rematchReady: false
+    rematchReady: false,
+    disconnected: false,
+    sessionId: null
   };
 
   send(socket, {
@@ -129,16 +230,21 @@ wss.on("connection", (socket) => {
       player.roomCode = roomCode;
       player.playerNumber = 1;
       player.rematchReady = false;
+      player.disconnected = false;
+
+      createPlayerSession(player);
 
       send(socket, {
         type: "ROOM_CREATED",
         roomCode,
         player: 1,
+        sessionId: player.sessionId,
         status: "WAITING",
         players: 1
       });
 
       console.log(`Room ${roomCode} created`);
+
       return;
     }
 
@@ -174,6 +280,9 @@ wss.on("connection", (socket) => {
       player.roomCode = roomCode;
       player.playerNumber = 2;
       player.rematchReady = false;
+      player.disconnected = false;
+
+      createPlayerSession(player);
 
       room.players.push(player);
       room.status = "READY";
@@ -184,6 +293,7 @@ wss.on("connection", (socket) => {
         type: "ROOM_JOINED",
         roomCode,
         player: 2,
+        sessionId: player.sessionId,
         status: room.status,
         players: 2
       });
@@ -198,18 +308,117 @@ wss.on("connection", (socket) => {
       });
 
       console.log(`Player 2 joined room ${roomCode}`);
+
+      return;
+    }
+
+    // RECONNECT SESSION
+    if (data.type === "RECONNECT_SESSION") {
+      const sessionId = String(data.sessionId || "").trim();
+
+      if (!sessionId) {
+        send(socket, {
+          type: "RECONNECT_FAILED",
+          message: "Missing session ID"
+        });
+        return;
+      }
+
+      const savedSession = disconnectedSessions.get(sessionId);
+
+      if (!savedSession) {
+        send(socket, {
+          type: "RECONNECT_FAILED",
+          message: "Session expired or not found"
+        });
+        return;
+      }
+
+      if (Date.now() > savedSession.expiresAt) {
+        disconnectedSessions.delete(sessionId);
+
+        send(socket, {
+          type: "RECONNECT_FAILED",
+          message: "Session expired"
+        });
+
+        return;
+      }
+
+      const room = rooms.get(savedSession.roomCode);
+
+      if (!room) {
+        disconnectedSessions.delete(sessionId);
+
+        send(socket, {
+          type: "RECONNECT_FAILED",
+          message: "Room no longer exists"
+        });
+
+        return;
+      }
+
+      const oldPlayer = savedSession.player;
+
+      oldPlayer.socket = socket;
+      oldPlayer.disconnected = false;
+
+      const restoredPlayer = oldPlayer;
+
+      const index = room.players.findIndex(
+        (p) => p.sessionId === sessionId
+      );
+
+      if (index !== -1) {
+        room.players[index] = restoredPlayer;
+      }
+
+      player.socket = socket;
+      player.roomCode = room.code;
+      player.playerNumber = savedSession.playerNumber;
+      player.sessionId = sessionId;
+      player.rematchReady = restoredPlayer.rematchReady || false;
+      player.disconnected = false;
+
+      room.players = room.players.map((p) => {
+        if (p.sessionId === sessionId) {
+          return player;
+        }
+
+        return p;
+      });
+
+      disconnectedSessions.delete(sessionId);
+
+      send(socket, {
+        type: "RECONNECT_SUCCESS",
+        roomCode: room.code,
+        player: player.playerNumber,
+        sessionId: player.sessionId,
+        status: room.status,
+        players: room.players.length
+      });
+
+      broadcastRoom(
+        room,
+        {
+          type: "OPPONENT_RECONNECTED",
+          player: player.playerNumber,
+          message: "Opponent reconnected"
+        },
+        player
+      );
+
+      console.log(
+        `Player ${player.playerNumber} reconnected to room ${room.code}`
+      );
+
       return;
     }
 
     // REMATCH REQUEST
     if (data.type === "REMATCH_REQUEST") {
-      if (!player.roomCode) {
-        send(socket, {
-          type: "ERROR",
-          message: "You are not in a room"
-        });
-        return;
-      }
+      if (!player.roomCode) return;
 
       const room = rooms.get(player.roomCode);
 
@@ -218,6 +427,7 @@ wss.on("connection", (socket) => {
           type: "ERROR",
           message: "Two players are required for a rematch"
         });
+
         return;
       }
 
@@ -231,10 +441,6 @@ wss.on("connection", (socket) => {
 
       player.rematchReady = true;
 
-      console.log(
-        `Player ${player.playerNumber} requested rematch in room ${room.code}`
-      );
-
       broadcastRoom(room, {
         type: "REMATCH_UPDATE",
         player1Ready: room.rematch.player1Ready,
@@ -246,8 +452,6 @@ wss.on("connection", (socket) => {
         room.rematch.player2Ready
       ) {
         room.status = "READY";
-
-        console.log(`Rematch starting in room ${room.code}`);
 
         broadcastRoom(room, {
           type: "REMATCH_START",
@@ -263,31 +467,21 @@ wss.on("connection", (socket) => {
 
     // PLAYER LEAVE MATCH
     if (data.type === "PLAYER_LEAVE_MATCH") {
-      if (!player.roomCode) {
-        send(socket, {
-          type: "LEFT_MATCH"
-        });
-        return;
-      }
+      if (!player.roomCode) return;
 
       const room = rooms.get(player.roomCode);
 
-      if (!room) {
-        send(socket, {
-          type: "LEFT_MATCH"
+      if (!room) return;
+
+      const opponent = room.players.find(
+        (p) => p !== player
+      );
+
+      if (opponent) {
+        send(opponent.socket, {
+          type: "OPPONENT_LEFT",
+          message: "Opponent left the match"
         });
-        return;
-      }
-
-      if (room.players.length === 2) {
-        const opponent = room.players.find((p) => p !== player);
-
-        if (opponent) {
-          send(opponent.socket, {
-            type: "OPPONENT_LEFT",
-            message: "Opponent left the match"
-          });
-        }
       }
 
       room.status = "WAITING";
@@ -310,7 +504,10 @@ wss.on("connection", (socket) => {
       if (!room) return;
 
       room.players.forEach((otherPlayer) => {
-        if (otherPlayer !== player) {
+        if (
+          otherPlayer !== player &&
+          !otherPlayer.disconnected
+        ) {
           send(otherPlayer.socket, {
             ...data,
             player: player.playerNumber
@@ -330,7 +527,10 @@ wss.on("connection", (socket) => {
       if (!room) return;
 
       room.players.forEach((otherPlayer) => {
-        if (otherPlayer !== player) {
+        if (
+          otherPlayer !== player &&
+          !otherPlayer.disconnected
+        ) {
           send(otherPlayer.socket, {
             ...data,
             player: player.playerNumber
@@ -350,7 +550,10 @@ wss.on("connection", (socket) => {
       if (!room) return;
 
       room.players.forEach((otherPlayer) => {
-        if (otherPlayer !== player) {
+        if (
+          otherPlayer !== player &&
+          !otherPlayer.disconnected
+        ) {
           send(otherPlayer.socket, {
             ...data,
             player: player.playerNumber
@@ -370,7 +573,10 @@ wss.on("connection", (socket) => {
       if (!room) return;
 
       room.players.forEach((otherPlayer) => {
-        if (otherPlayer !== player) {
+        if (
+          otherPlayer !== player &&
+          !otherPlayer.disconnected
+        ) {
           send(otherPlayer.socket, {
             ...data,
             player: player.playerNumber
@@ -393,8 +599,6 @@ wss.on("connection", (socket) => {
       if (data.loser !== 1 && data.loser !== 2) return;
 
       room.status = "FINISHED";
-
-      resetRematchState(room);
 
       broadcastRoom(room, {
         type: "PLAYER_MATCH_RESULT",
@@ -423,8 +627,12 @@ wss.on("connection", (socket) => {
   });
 
   socket.on("close", () => {
-    console.log("Player disconnected");
-    removePlayerFromRoom(player);
+    if (!player.roomCode) {
+      console.log("Player disconnected without room");
+      return;
+    }
+
+    reserveDisconnectedPlayer(player);
   });
 });
 
