@@ -28,11 +28,20 @@ function send(socket, data) {
   }
 }
 
-function broadcastRoom(room, data, excludeSocket = null) {
+function broadcastRoom(room, data) {
   room.players.forEach((player) => {
-    if (player.socket !== excludeSocket) {
-      send(player.socket, data);
-    }
+    send(player.socket, data);
+  });
+}
+
+function resetRematchState(room) {
+  room.rematch = {
+    player1Ready: false,
+    player2Ready: false
+  };
+
+  room.players.forEach((player) => {
+    player.rematchReady = false;
   });
 }
 
@@ -41,43 +50,39 @@ function removePlayerFromRoom(player) {
 
   const room = rooms.get(player.roomCode);
 
-  if (!room) {
-    player.roomCode = null;
-    player.playerNumber = null;
-    return;
-  }
+  if (!room) return;
 
   room.players = room.players.filter((p) => p !== player);
 
   player.roomCode = null;
   player.playerNumber = null;
+  player.rematchReady = false;
 
   if (room.players.length === 0) {
     rooms.delete(room.code);
-    console.log(`Room ${room.code} deleted`);
     return;
   }
 
   room.status = "WAITING";
 
-  broadcastRoom(room, {
-    type: "ROOM_UPDATE",
-    roomCode: room.code,
-    status: room.status,
-    players: room.players.length
-  });
+  resetRematchState(room);
 
-  console.log(`Player left room ${room.code}`);
+  broadcastRoom(room, {
+    type: "OPPONENT_LEFT",
+    message: "Opponent left the match",
+    roomCode: room.code,
+    players: room.players.length,
+    status: room.status
+  });
 }
 
 wss.on("connection", (socket) => {
   const player = {
     socket,
     roomCode: null,
-    playerNumber: null
+    playerNumber: null,
+    rematchReady: false
   };
-
-  console.log("Player connected");
 
   send(socket, {
     type: "CONNECTED",
@@ -97,10 +102,7 @@ wss.on("connection", (socket) => {
       return;
     }
 
-    // ==========================================
     // CREATE ROOM
-    // ==========================================
-
     if (data.type === "CREATE_ROOM") {
       if (player.roomCode) {
         send(socket, {
@@ -115,13 +117,18 @@ wss.on("connection", (socket) => {
       const room = {
         code: roomCode,
         status: "WAITING",
-        players: [player]
+        players: [player],
+        rematch: {
+          player1Ready: false,
+          player2Ready: false
+        }
       };
 
       rooms.set(roomCode, room);
 
       player.roomCode = roomCode;
       player.playerNumber = 1;
+      player.rematchReady = false;
 
       send(socket, {
         type: "ROOM_CREATED",
@@ -132,14 +139,10 @@ wss.on("connection", (socket) => {
       });
 
       console.log(`Room ${roomCode} created`);
-
       return;
     }
 
-    // ==========================================
     // JOIN ROOM
-    // ==========================================
-
     if (data.type === "JOIN_ROOM") {
       const roomCode = String(data.roomCode || "").trim();
       const room = rooms.get(roomCode);
@@ -170,9 +173,12 @@ wss.on("connection", (socket) => {
 
       player.roomCode = roomCode;
       player.playerNumber = 2;
+      player.rematchReady = false;
 
       room.players.push(player);
       room.status = "READY";
+
+      resetRematchState(room);
 
       send(socket, {
         type: "ROOM_JOINED",
@@ -192,14 +198,110 @@ wss.on("connection", (socket) => {
       });
 
       console.log(`Player 2 joined room ${roomCode}`);
+      return;
+    }
+
+    // REMATCH REQUEST
+    if (data.type === "REMATCH_REQUEST") {
+      if (!player.roomCode) {
+        send(socket, {
+          type: "ERROR",
+          message: "You are not in a room"
+        });
+        return;
+      }
+
+      const room = rooms.get(player.roomCode);
+
+      if (!room || room.players.length !== 2) {
+        send(socket, {
+          type: "ERROR",
+          message: "Two players are required for a rematch"
+        });
+        return;
+      }
+
+      if (player.playerNumber === 1) {
+        room.rematch.player1Ready = true;
+      }
+
+      if (player.playerNumber === 2) {
+        room.rematch.player2Ready = true;
+      }
+
+      player.rematchReady = true;
+
+      console.log(
+        `Player ${player.playerNumber} requested rematch in room ${room.code}`
+      );
+
+      broadcastRoom(room, {
+        type: "REMATCH_UPDATE",
+        player1Ready: room.rematch.player1Ready,
+        player2Ready: room.rematch.player2Ready
+      });
+
+      if (
+        room.rematch.player1Ready &&
+        room.rematch.player2Ready
+      ) {
+        room.status = "READY";
+
+        console.log(`Rematch starting in room ${room.code}`);
+
+        broadcastRoom(room, {
+          type: "REMATCH_START",
+          roomCode: room.code,
+          status: "READY"
+        });
+
+        resetRematchState(room);
+      }
 
       return;
     }
 
-    // ==========================================
-    // PLAYER MOVEMENT STATE
-    // ==========================================
+    // PLAYER LEAVE MATCH
+    if (data.type === "PLAYER_LEAVE_MATCH") {
+      if (!player.roomCode) {
+        send(socket, {
+          type: "LEFT_MATCH"
+        });
+        return;
+      }
 
+      const room = rooms.get(player.roomCode);
+
+      if (!room) {
+        send(socket, {
+          type: "LEFT_MATCH"
+        });
+        return;
+      }
+
+      if (room.players.length === 2) {
+        const opponent = room.players.find((p) => p !== player);
+
+        if (opponent) {
+          send(opponent.socket, {
+            type: "OPPONENT_LEFT",
+            message: "Opponent left the match"
+          });
+        }
+      }
+
+      room.status = "WAITING";
+
+      resetRematchState(room);
+
+      send(socket, {
+        type: "LEFT_MATCH"
+      });
+
+      return;
+    }
+
+    // PLAYER STATE
     if (data.type === "PLAYER_STATE") {
       if (!player.roomCode) return;
 
@@ -207,34 +309,19 @@ wss.on("connection", (socket) => {
 
       if (!room) return;
 
-      const otherPlayer = room.players.find(
-        (p) => p !== player
-      );
-
-      if (!otherPlayer) return;
-
-      const state = {
-        type: "PLAYER_STATE",
-        player: player.playerNumber,
-        x: Number(data.x) || 0,
-        y: Number(data.y) || 0,
-        velocityX: Number(data.velocityX) || 0,
-        velocityY: Number(data.velocityY) || 0,
-        facing: data.facing === "left" ? "left" : "right",
-        grounded: Boolean(data.grounded),
-        crouching: Boolean(data.crouching),
-        jumping: Boolean(data.jumping)
-      };
-
-      send(otherPlayer.socket, state);
+      room.players.forEach((otherPlayer) => {
+        if (otherPlayer !== player) {
+          send(otherPlayer.socket, {
+            ...data,
+            player: player.playerNumber
+          });
+        }
+      });
 
       return;
     }
 
-    // ==========================================
     // PLAYER ATTACK
-    // ==========================================
-
     if (data.type === "PLAYER_ATTACK") {
       if (!player.roomCode) return;
 
@@ -242,39 +329,19 @@ wss.on("connection", (socket) => {
 
       if (!room) return;
 
-      const otherPlayer = room.players.find(
-        (p) => p !== player
-      );
-
-      if (!otherPlayer) return;
-
-      if (
-        data.attack !== "punch" &&
-        data.attack !== "kick"
-      ) {
-        return;
-      }
-
-      const attack = {
-        type: "PLAYER_ATTACK",
-        player: player.playerNumber,
-        attack: data.attack,
-        timestamp: Date.now()
-      };
-
-      send(otherPlayer.socket, attack);
-
-      console.log(
-        `Player ${player.playerNumber} used ${data.attack} in room ${room.code}`
-      );
+      room.players.forEach((otherPlayer) => {
+        if (otherPlayer !== player) {
+          send(otherPlayer.socket, {
+            ...data,
+            player: player.playerNumber
+          });
+        }
+      });
 
       return;
     }
 
-    // ==========================================
     // PLAYER DEFENSE
-    // ==========================================
-
     if (data.type === "PLAYER_DEFENSE") {
       if (!player.roomCode) return;
 
@@ -282,39 +349,19 @@ wss.on("connection", (socket) => {
 
       if (!room) return;
 
-      const otherPlayer = room.players.find(
-        (p) => p !== player
-      );
-
-      if (!otherPlayer) return;
-
-      if (
-        data.action !== "start" &&
-        data.action !== "stop"
-      ) {
-        return;
-      }
-
-      const defense = {
-        type: "PLAYER_DEFENSE",
-        player: player.playerNumber,
-        action: data.action,
-        timestamp: Date.now()
-      };
-
-      send(otherPlayer.socket, defense);
-
-      console.log(
-        `Player ${player.playerNumber} defense: ${data.action}`
-      );
+      room.players.forEach((otherPlayer) => {
+        if (otherPlayer !== player) {
+          send(otherPlayer.socket, {
+            ...data,
+            player: player.playerNumber
+          });
+        }
+      });
 
       return;
     }
 
-    // ==========================================
     // PLAYER DODGE
-    // ==========================================
-
     if (data.type === "PLAYER_DODGE") {
       if (!player.roomCode) return;
 
@@ -322,39 +369,43 @@ wss.on("connection", (socket) => {
 
       if (!room) return;
 
-      const otherPlayer = room.players.find(
-        (p) => p !== player
-      );
-
-      if (!otherPlayer) return;
-
-      if (
-        data.direction !== "left" &&
-        data.direction !== "right"
-      ) {
-        return;
-      }
-
-      const dodge = {
-        type: "PLAYER_DODGE",
-        player: player.playerNumber,
-        direction: data.direction,
-        timestamp: Date.now()
-      };
-
-      send(otherPlayer.socket, dodge);
-
-      console.log(
-        `Player ${player.playerNumber} dodged ${data.direction} in room ${room.code}`
-      );
+      room.players.forEach((otherPlayer) => {
+        if (otherPlayer !== player) {
+          send(otherPlayer.socket, {
+            ...data,
+            player: player.playerNumber
+          });
+        }
+      });
 
       return;
     }
 
-    // ==========================================
-    // LEAVE ROOM
-    // ==========================================
+    // PLAYER MATCH RESULT
+    if (data.type === "PLAYER_MATCH_RESULT") {
+      if (!player.roomCode) return;
 
+      const room = rooms.get(player.roomCode);
+
+      if (!room) return;
+
+      if (data.winner !== 1 && data.winner !== 2) return;
+      if (data.loser !== 1 && data.loser !== 2) return;
+
+      room.status = "FINISHED";
+
+      resetRematchState(room);
+
+      broadcastRoom(room, {
+        type: "PLAYER_MATCH_RESULT",
+        winner: data.winner,
+        loser: data.loser
+      });
+
+      return;
+    }
+
+    // LEAVE ROOM
     if (data.type === "LEAVE_ROOM") {
       removePlayerFromRoom(player);
 
@@ -365,27 +416,15 @@ wss.on("connection", (socket) => {
       return;
     }
 
-    // ==========================================
-    // UNKNOWN MESSAGE
-    // ==========================================
-
     send(socket, {
       type: "ERROR",
       message: "Unknown message type"
     });
   });
 
-  // ==========================================
-  // DISCONNECT
-  // ==========================================
-
   socket.on("close", () => {
     console.log("Player disconnected");
     removePlayerFromRoom(player);
-  });
-
-  socket.on("error", (error) => {
-    console.log("WebSocket error:", error.message);
   });
 });
 
