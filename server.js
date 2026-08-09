@@ -174,7 +174,6 @@ wss.on("connection", (socket) => {
       room.players.push(player);
       room.status = "READY";
 
-      // Player 2 confirmation
       send(socket, {
         type: "ROOM_JOINED",
         roomCode,
@@ -183,7 +182,6 @@ wss.on("connection", (socket) => {
         players: 2
       });
 
-      // Notify Player 1
       const player1 = room.players[0];
 
       send(player1.socket, {
@@ -199,29 +197,20 @@ wss.on("connection", (socket) => {
     }
 
     // ==========================================
-    // PLAYER STATE
+    // PLAYER MOVEMENT STATE
     // ==========================================
 
     if (data.type === "PLAYER_STATE") {
       if (!player.roomCode) {
-        send(socket, {
-          type: "ERROR",
-          message: "You are not inside a room"
-        });
         return;
       }
 
       const room = rooms.get(player.roomCode);
 
       if (!room) {
-        send(socket, {
-          type: "ERROR",
-          message: "Room not found"
-        });
         return;
       }
 
-      // Find the other player
       const otherPlayer = room.players.find(
         (p) => p !== player
       );
@@ -230,7 +219,6 @@ wss.on("connection", (socket) => {
         return;
       }
 
-      // Only forward the allowed movement state.
       const state = {
         type: "PLAYER_STATE",
         player: player.playerNumber,
@@ -244,8 +232,55 @@ wss.on("connection", (socket) => {
         jumping: Boolean(data.jumping)
       };
 
-      // Send only to the other player.
       send(otherPlayer.socket, state);
+
+      return;
+    }
+
+    // ==========================================
+    // PLAYER ATTACK
+    // ==========================================
+
+    if (data.type === "PLAYER_ATTACK") {
+      if (!player.roomCode) {
+        return;
+      }
+
+      const room = rooms.get(player.roomCode);
+
+      if (!room) {
+        return;
+      }
+
+      const otherPlayer = room.players.find(
+        (p) => p !== player
+      );
+
+      if (!otherPlayer) {
+        return;
+      }
+
+      // Only allow the two attacks currently implemented.
+      if (
+        data.attack !== "punch" &&
+        data.attack !== "kick"
+      ) {
+        return;
+      }
+
+      const attack = {
+        type: "PLAYER_ATTACK",
+        player: player.playerNumber,
+        attack: data.attack,
+        timestamp: Date.now()
+      };
+
+      // Send the attack ONLY to the opponent.
+      send(otherPlayer.socket, attack);
+
+      console.log(
+        `Player ${player.playerNumber} used ${data.attack} in room ${room.code}`
+      );
 
       return;
     }
@@ -273,6 +308,10 @@ wss.on("connection", (socket) => {
       message: "Unknown message type"
     });
   });
+
+  // ==========================================
+  // DISCONNECT
+  // ==========================================
 
   socket.on("close", () => {
     console.log("Player disconnected");
