@@ -28,9 +28,11 @@ function send(socket, data) {
   }
 }
 
-function broadcastRoom(room, data) {
+function broadcastRoom(room, data, excludeSocket = null) {
   room.players.forEach((player) => {
-    send(player.socket, data);
+    if (player.socket !== excludeSocket) {
+      send(player.socket, data);
+    }
   });
 }
 
@@ -39,14 +41,20 @@ function removePlayerFromRoom(player) {
 
   const room = rooms.get(player.roomCode);
 
-  if (!room) return;
+  if (!room) {
+    player.roomCode = null;
+    player.playerNumber = null;
+    return;
+  }
 
   room.players = room.players.filter((p) => p !== player);
 
   player.roomCode = null;
+  player.playerNumber = null;
 
   if (room.players.length === 0) {
     rooms.delete(room.code);
+    console.log(`Room ${room.code} deleted`);
     return;
   }
 
@@ -58,6 +66,8 @@ function removePlayerFromRoom(player) {
     status: room.status,
     players: room.players.length
   });
+
+  console.log(`Player left room ${room.code}`);
 }
 
 wss.on("connection", (socket) => {
@@ -66,6 +76,8 @@ wss.on("connection", (socket) => {
     roomCode: null,
     playerNumber: null
   };
+
+  console.log("Player connected");
 
   send(socket, {
     type: "CONNECTED",
@@ -85,7 +97,10 @@ wss.on("connection", (socket) => {
       return;
     }
 
+    // ==========================================
     // CREATE ROOM
+    // ==========================================
+
     if (data.type === "CREATE_ROOM") {
       if (player.roomCode) {
         send(socket, {
@@ -117,10 +132,14 @@ wss.on("connection", (socket) => {
       });
 
       console.log(`Room ${roomCode} created`);
+
       return;
     }
 
+    // ==========================================
     // JOIN ROOM
+    // ==========================================
+
     if (data.type === "JOIN_ROOM") {
       const roomCode = String(data.roomCode || "").trim();
       const room = rooms.get(roomCode);
@@ -155,7 +174,7 @@ wss.on("connection", (socket) => {
       room.players.push(player);
       room.status = "READY";
 
-      // Tell Player 2 that the join was successful
+      // Player 2 confirmation
       send(socket, {
         type: "ROOM_JOINED",
         roomCode,
@@ -164,7 +183,7 @@ wss.on("connection", (socket) => {
         players: 2
       });
 
-      // Tell Player 1 that Player 2 joined
+      // Notify Player 1
       const player1 = room.players[0];
 
       send(player1.socket, {
@@ -175,10 +194,66 @@ wss.on("connection", (socket) => {
       });
 
       console.log(`Player 2 joined room ${roomCode}`);
+
       return;
     }
 
+    // ==========================================
+    // PLAYER STATE
+    // ==========================================
+
+    if (data.type === "PLAYER_STATE") {
+      if (!player.roomCode) {
+        send(socket, {
+          type: "ERROR",
+          message: "You are not inside a room"
+        });
+        return;
+      }
+
+      const room = rooms.get(player.roomCode);
+
+      if (!room) {
+        send(socket, {
+          type: "ERROR",
+          message: "Room not found"
+        });
+        return;
+      }
+
+      // Find the other player
+      const otherPlayer = room.players.find(
+        (p) => p !== player
+      );
+
+      if (!otherPlayer) {
+        return;
+      }
+
+      // Only forward the allowed movement state.
+      const state = {
+        type: "PLAYER_STATE",
+        player: player.playerNumber,
+        x: Number(data.x) || 0,
+        y: Number(data.y) || 0,
+        velocityX: Number(data.velocityX) || 0,
+        velocityY: Number(data.velocityY) || 0,
+        facing: data.facing === "left" ? "left" : "right",
+        grounded: Boolean(data.grounded),
+        crouching: Boolean(data.crouching),
+        jumping: Boolean(data.jumping)
+      };
+
+      // Send only to the other player.
+      send(otherPlayer.socket, state);
+
+      return;
+    }
+
+    // ==========================================
     // LEAVE ROOM
+    // ==========================================
+
     if (data.type === "LEAVE_ROOM") {
       removePlayerFromRoom(player);
 
@@ -189,6 +264,10 @@ wss.on("connection", (socket) => {
       return;
     }
 
+    // ==========================================
+    // UNKNOWN MESSAGE
+    // ==========================================
+
     send(socket, {
       type: "ERROR",
       message: "Unknown message type"
@@ -198,6 +277,10 @@ wss.on("connection", (socket) => {
   socket.on("close", () => {
     console.log("Player disconnected");
     removePlayerFromRoom(player);
+  });
+
+  socket.on("error", (error) => {
+    console.log("WebSocket error:", error.message);
   });
 });
 
